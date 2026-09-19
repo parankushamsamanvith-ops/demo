@@ -48,7 +48,7 @@ async def inspect_user_document_vault(
     """
     user_id_str = str(user_id)
     today = date.today()
-    normalized_types = [t.strip().upper() for t in required_types]
+    normalized_types = [t.strip().upper() for t in required_types if t and t.strip()]
 
     checklist_results = []
 
@@ -61,6 +61,32 @@ async def inspect_user_document_vault(
         )
         res = await session.execute(stmt)
         user_docs = res.scalars().all()
+
+        # If no specific required document types were requested, return the full inventory of user's active documents
+        if not normalized_types:
+            for doc in user_docs:
+                expiry = doc.expiry_date
+                status_str = "AVAILABLE"
+                notes = f"{doc.title} is uploaded and active in your vault."
+
+                if expiry:
+                    days_left = (expiry - today).days
+                    if days_left <= 0:
+                        status_str = "EXPIRED"
+                        notes = f"{doc.title} expired on {expiry.isoformat()}. Must be renewed."
+                    elif days_left <= 90:
+                        status_str = "EXPIRING_SOON"
+                        notes = f"{doc.title} expires in {days_left} days ({expiry.isoformat()}). Renewal recommended."
+
+                checklist_results.append({
+                    "doc_type": doc.doc_type.upper(),
+                    "status": status_str,
+                    "doc_id": str(doc.id),
+                    "title": doc.title,
+                    "expiry_date": expiry.isoformat() if expiry else None,
+                    "notes": notes,
+                })
+            return checklist_results
 
         # Build lookup table by normalized doc_type
         docs_by_type: Dict[str, Document] = {}
@@ -91,16 +117,16 @@ async def inspect_user_document_vault(
             # Evaluate expiration boundaries
             expiry = matched_doc.expiry_date
             status_str = "AVAILABLE"
-            notes = "Document ready for submission."
+            notes = f"{matched_doc.title} ready for submission."
 
             if expiry:
                 days_left = (expiry - today).days
                 if days_left <= 0:
                     status_str = "EXPIRED"
-                    notes = f"Expired on {expiry.isoformat()}. Must be renewed."
+                    notes = f"{matched_doc.title} expired on {expiry.isoformat()}. Must be renewed."
                 elif days_left <= 90:
                     status_str = "EXPIRING_SOON"
-                    notes = f"Expires in {days_left} days ({expiry.isoformat()}). Renewal recommended."
+                    notes = f"{matched_doc.title} expires in {days_left} days ({expiry.isoformat()}). Renewal recommended."
 
             checklist_results.append({
                 "doc_type": req,

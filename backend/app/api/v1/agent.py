@@ -101,10 +101,11 @@ async def run_agent_stream(
                         for item in node_state.get("document_checklist", [])
                     ]
                     final_checklist = checklist_raw
+                    is_task_complete = node_state.get("is_complete", False)
                     event_payload["data"] = {
                         "checklist": checklist_raw,
                         "missing_docs": node_state.get("missing_docs", []),
-                        "is_complete": node_state.get("is_complete", False),
+                        "is_complete": is_task_complete,
                     }
 
                 elif node_name == "synthesize_guidance":
@@ -130,6 +131,13 @@ async def run_agent_stream(
     try:
         async with async_session_factory() as db:
             user_id_str = str(user_id)
+            if is_task_complete:
+                computed_status = TaskStatus.READY_TO_SUBMIT
+            elif any(i.get("status") in ["MISSING", "EXPIRED"] for i in final_checklist):
+                computed_status = TaskStatus.WAITING_DOCUMENTS
+            else:
+                computed_status = TaskStatus.IN_PROGRESS if final_checklist else TaskStatus.NOT_STARTED
+
             if task_id:
                 stmt = select(BureaucraticTask).where(
                     and_(BureaucraticTask.id == str(task_id), BureaucraticTask.user_id == user_id_str)
@@ -138,22 +146,14 @@ async def run_agent_stream(
                 task = res.scalar_one_or_none()
                 if task:
                     task.checklist_state = final_checklist
-                    task.status = (
-                        TaskStatus.READY_TO_SUBMIT
-                        if len([i for i in final_checklist if i.get("status") in ["MISSING", "EXPIRED"]]) == 0
-                        else TaskStatus.WAITING_DOCUMENTS
-                    )
+                    task.status = computed_status
                     await db.commit()
             else:
                 new_task = BureaucraticTask(
                     user_id=user_id_str,
                     task_name=task_name_detected,
                     target_country=target_country_detected,
-                    status=(
-                        TaskStatus.READY_TO_SUBMIT
-                        if len([i for i in final_checklist if i.get("status") in ["MISSING", "EXPIRED"]]) == 0
-                        else TaskStatus.WAITING_DOCUMENTS
-                    ),
+                    status=computed_status,
                     checklist_state=final_checklist,
                 )
                 db.add(new_task)

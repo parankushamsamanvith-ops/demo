@@ -85,43 +85,62 @@ class DocumentVisionService:
             raise ValueError("File contains no readable images.")
 
         prompt = (
-            "Analyze this document image. Identify doc_type (PASSPORT, NATIONAL_ID, VISA, TAX_RETURN, DEGREE), "
+            "Analyze this document image. Identify doc_type (PASSPORT, NATIONAL_ID, VISA, TAX_RETURN, DEGREE, OTHER), "
             "category (IDENTITY, TAXATION, TRAVEL, EDUCATION, CIVIL, OTHER), 3-letter issuing country code, "
-            "dates in YYYY-MM-DD format, and document numbers. Never expose sensitive private identifiers."
+            "dates in YYYY-MM-DD format, title, and document numbers. Never expose sensitive private identifiers. "
+            "Respond ONLY with a valid JSON object matching keys: "
+            '{"title": "...", "doc_type": "...", "category": "...", "issuing_country": "...", "document_number": "...", "issue_date": "YYYY-MM-DD", "expiry_date": "YYYY-MM-DD", "holder_name": "..."}'
         )
 
+        extracted = None
+
         if self.openai_client:
-            buffered = io.BytesIO()
-            pil_images[0].save(buffered, format="JPEG")
-            img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
-            res = self.openai_client.chat.completions.create(
-                model="grok-2-vision-latest",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt + " Respond in JSON format."},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
-                        ]
-                    }
-                ],
-                response_format={"type": "json_object"}
+            try:
+                buffered = io.BytesIO()
+                pil_images[0].save(buffered, format="JPEG")
+                img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+                res = self.openai_client.chat.completions.create(
+                    model="grok-2-vision-latest",
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+                            ]
+                        }
+                    ],
+                    response_format={"type": "json_object"}
+                )
+                raw_content = res.choices[0].message.content
+                extracted = DocumentMetadataExtraction.model_validate_json(raw_content)
+            except Exception:
+                pass
+
+        if not extracted and self.gemini_client:
+            for model_name in ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-flash-latest"]:
+                try:
+                    response = self.gemini_client.models.generate_content(
+                        model=model_name,
+                        contents=[prompt] + pil_images,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.1,
+                        ),
+                    )
+                    clean_text = response.text.replace("```json", "").replace("```", "").strip()
+                    data = json.loads(clean_text)
+                    extracted = DocumentMetadataExtraction.model_validate(data)
+                    break
+                except Exception:
+                    continue
+
+        if not extracted:
+            extracted = DocumentMetadataExtraction(
+                title="Uploaded Document",
+                doc_type="OTHER",
+                category=DocumentCategory.OTHER,
             )
-            raw_content = res.choices[0].message.content
-            extracted = DocumentMetadataExtraction.model_validate_json(raw_content)
-        elif self.gemini_client:
-            response = self.gemini_client.models.generate_content(
-                model="gemini-3.6-flash",
-                contents=[prompt] + pil_images,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=DocumentMetadataExtraction,
-                    temperature=0.1,
-                ),
-            )
-            extracted = DocumentMetadataExtraction.model_validate_json(response.text)
-        else:
-            raise ValueError("No AI vision API key configured (XAI_API_KEY or GEMINI_API_KEY required).")
 
         if extracted.document_number:
             extracted.document_number = sanitize_sensitive_identifiers(extracted.doc_type, extracted.document_number)
