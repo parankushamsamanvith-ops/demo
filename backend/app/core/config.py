@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     # External LLM / Multimodal APIs
     GEMINI_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
+    XAI_API_KEY: str = ""
+    XAI_BASE_URL: str = "https://api.x.ai/v1"
+    GROQ_API_KEY: str = ""
+    GROQ_MODEL_NAME: str = "openai/gpt-oss-120b"
+    GROQ_BASE_URL: str = "https://api.groq.com/openai/v1"
 
     # Document Storage Vault Path
     STORAGE_VAULT_PATH: str = str(Path(__file__).resolve().parents[2] / "data" / "encrypted_vault")

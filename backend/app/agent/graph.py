@@ -1,6 +1,7 @@
 import json
 from typing import Literal, List, Dict, Any
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
 from langgraph.graph import StateGraph, END
 
@@ -11,11 +12,44 @@ from app.agent.tools import (
     inspect_user_document_vault,
 )
 
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    google_api_key=settings.GEMINI_API_KEY,
-    temperature=0.1,
-)
+if settings.GROQ_API_KEY:
+    llm = ChatOpenAI(
+        model=settings.GROQ_MODEL_NAME,
+        api_key=settings.GROQ_API_KEY,
+        base_url=settings.GROQ_BASE_URL,
+        temperature=0.1,
+    )
+elif settings.XAI_API_KEY:
+    llm = ChatOpenAI(
+        model="grok-2-latest",
+        api_key=settings.XAI_API_KEY,
+        base_url=settings.XAI_BASE_URL,
+        temperature=0.1,
+    )
+else:
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-3.6-flash",
+        google_api_key=settings.GEMINI_API_KEY or "DUMMY_KEY",
+        temperature=0.1,
+    )
+
+
+def _extract_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts = []
+        for item in content:
+            if isinstance(item, dict) and "text" in item:
+                texts.append(item["text"])
+            elif isinstance(item, str):
+                texts.append(item)
+            elif hasattr(item, "text"):
+                texts.append(getattr(item, "text"))
+            else:
+                texts.append(str(item))
+        return "".join(texts)
+    return str(content)
 
 
 async def parse_intent_node(state: AgentState) -> dict:
@@ -29,7 +63,8 @@ async def parse_intent_node(state: AgentState) -> dict:
     response = await llm.ainvoke([SystemMessage(content=system_prompt)] + messages)
 
     try:
-        clean_text = response.content.replace("```json", "").replace("```", "").strip()
+        raw_text = _extract_text(response.content)
+        clean_text = raw_text.replace("```json", "").replace("```", "").strip()
         data = json.loads(clean_text)
         return {
             "target_country": data.get("country_code", "GLOBAL"),
@@ -63,7 +98,8 @@ async def retrieve_rules_node(state: AgentState) -> dict:
     res = await llm.ainvoke([HumanMessage(content=extraction_prompt)])
 
     try:
-        clean_res = res.content.replace("```json", "").replace("```", "").strip()
+        raw_res = _extract_text(res.content)
+        clean_res = raw_res.replace("```json", "").replace("```", "").strip()
         required_docs = json.loads(clean_res)
     except Exception:
         required_docs = ["PASSPORT", "NATIONAL_ID"]
@@ -136,9 +172,11 @@ async def synthesize_guidance_node(state: AgentState) -> dict:
         HumanMessage(content=prompt),
     ])
 
+    response_text = _extract_text(response.content)
+
     return {
-        "messages": [AIMessage(content=response.content)],
-        "next_step_instruction": response.content,
+        "messages": [AIMessage(content=response_text)],
+        "next_step_instruction": response_text,
     }
 
 

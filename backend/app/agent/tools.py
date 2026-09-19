@@ -46,7 +46,7 @@ async def inspect_user_document_vault(
     evaluating their active validity, expiration dates, and readiness.
     Safely redacts restricted identity numbers.
     """
-    parsed_uuid = uuid.UUID(user_id)
+    user_id_str = str(user_id)
     today = date.today()
     normalized_types = [t.strip().upper() for t in required_types]
 
@@ -55,7 +55,7 @@ async def inspect_user_document_vault(
     async with async_session_factory() as session:
         stmt = select(Document).where(
             and_(
-                Document.user_id == parsed_uuid,
+                Document.user_id == user_id_str,
                 Document.status != DocumentStatus.EXPIRED,
             )
         )
@@ -123,14 +123,14 @@ async def retrieve_document_data_for_form(
     Safely decrypts metadata for a specific document to assist in form filling.
     Never exposes raw Aadhaar, RRN, or MyNumber digits under any circumstances.
     """
-    parsed_user_id = uuid.UUID(user_id)
-    parsed_doc_id = uuid.UUID(doc_id)
+    user_id_str = str(user_id)
+    doc_id_str = str(doc_id)
 
     async with async_session_factory() as session:
         stmt = select(Document).where(
             and_(
-                Document.id == parsed_doc_id,
-                Document.user_id == parsed_user_id,
+                Document.id == doc_id_str,
+                Document.user_id == user_id_str,
             )
         )
         res = await session.execute(stmt)

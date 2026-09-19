@@ -45,7 +45,7 @@ class TaskResponse(BaseModel):
 # ==============================================================================
 
 async def run_agent_stream(
-    user_id: uuid.UUID,
+    user_id: str,
     user_message: str,
     task_id: Optional[uuid.UUID],
 ) -> AsyncGenerator[str, None]:
@@ -73,79 +73,95 @@ async def run_agent_stream(
     task_name_detected = "Bureaucratic Inquiry"
     target_country_detected = None
 
-    async for output in bureaucracy_agent_app.astream(initial_state):
-        for node_name, node_state in output.items():
-            # Emit structured telemetry event for the UI
-            event_payload = {
-                "event": "node_update",
-                "node": node_name,
-            }
-
-            if node_name == "parse_intent":
-                task_name_detected = node_state.get("procedure_topic") or task_name_detected
-                target_country_detected = node_state.get("target_country")
-                event_payload["data"] = {
-                    "procedure_topic": task_name_detected,
-                    "target_country": target_country_detected,
+    try:
+        async for output in bureaucracy_agent_app.astream(initial_state):
+            for node_name, node_state in output.items():
+                # Emit structured telemetry event for the UI
+                event_payload = {
+                    "event": "node_update",
+                    "node": node_name,
                 }
 
-            elif node_name == "retrieve_rules":
-                event_payload["data"] = {
-                    "required_docs": node_state.get("required_docs", []),
-                }
+                if node_name == "parse_intent":
+                    task_name_detected = node_state.get("procedure_topic") or task_name_detected
+                    target_country_detected = node_state.get("target_country")
+                    event_payload["data"] = {
+                        "procedure_topic": task_name_detected,
+                        "target_country": target_country_detected,
+                    }
 
-            elif node_name == "audit_vault":
-                checklist_raw = [
-                    item.model_dump() if hasattr(item, "model_dump") else dict(item)
-                    for item in node_state.get("document_checklist", [])
-                ]
-                final_checklist = checklist_raw
-                event_payload["data"] = {
-                    "checklist": checklist_raw,
-                    "missing_docs": node_state.get("missing_docs", []),
-                    "is_complete": node_state.get("is_complete", False),
-                }
+                elif node_name == "retrieve_rules":
+                    event_payload["data"] = {
+                        "required_docs": node_state.get("required_docs", []),
+                    }
 
-            elif node_name == "synthesize_guidance":
-                event_payload["data"] = {
-                    "answer": node_state.get("next_step_instruction", ""),
-                }
+                elif node_name == "audit_vault":
+                    checklist_raw = [
+                        item.model_dump() if hasattr(item, "model_dump") else dict(item)
+                        for item in node_state.get("document_checklist", [])
+                    ]
+                    final_checklist = checklist_raw
+                    event_payload["data"] = {
+                        "checklist": checklist_raw,
+                        "missing_docs": node_state.get("missing_docs", []),
+                        "is_complete": node_state.get("is_complete", False),
+                    }
 
-            # Yield SSE format
-            yield f"data: {json.dumps(event_payload)}\n\n"
+                elif node_name == "synthesize_guidance":
+                    event_payload["data"] = {
+                        "answer": node_state.get("next_step_instruction", ""),
+                    }
 
-    # Save or update task state in PostgreSQL
-    async with async_session_factory() as db:
-        if task_id:
-            stmt = select(BureaucraticTask).where(
-                and_(BureaucraticTask.id == task_id, BureaucraticTask.user_id == user_id)
-            )
-            res = await db.execute(stmt)
-            task = res.scalar_one_or_none()
-            if task:
-                task.checklist_state = final_checklist
-                task.status = (
-                    TaskStatus.READY_TO_SUBMIT
-                    if len([i for i in final_checklist if i.get("status") in ["MISSING", "EXPIRED"]]) == 0
-                    else TaskStatus.WAITING_DOCUMENTS
+                # Yield SSE format
+                yield f"data: {json.dumps(event_payload)}\n\n"
+    except Exception as exc:
+        error_payload = {
+            "event": "node_update",
+            "node": "synthesize_guidance",
+            "data": {
+                "answer": f"An error occurred while processing your request: {str(exc)}",
+            },
+        }
+        yield f"data: {json.dumps(error_payload)}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+
+    # Save or update task state in database
+    try:
+        async with async_session_factory() as db:
+            user_id_str = str(user_id)
+            if task_id:
+                stmt = select(BureaucraticTask).where(
+                    and_(BureaucraticTask.id == str(task_id), BureaucraticTask.user_id == user_id_str)
                 )
+                res = await db.execute(stmt)
+                task = res.scalar_one_or_none()
+                if task:
+                    task.checklist_state = final_checklist
+                    task.status = (
+                        TaskStatus.READY_TO_SUBMIT
+                        if len([i for i in final_checklist if i.get("status") in ["MISSING", "EXPIRED"]]) == 0
+                        else TaskStatus.WAITING_DOCUMENTS
+                    )
+                    await db.commit()
+            else:
+                new_task = BureaucraticTask(
+                    user_id=user_id_str,
+                    task_name=task_name_detected,
+                    target_country=target_country_detected,
+                    status=(
+                        TaskStatus.READY_TO_SUBMIT
+                        if len([i for i in final_checklist if i.get("status") in ["MISSING", "EXPIRED"]]) == 0
+                        else TaskStatus.WAITING_DOCUMENTS
+                    ),
+                    checklist_state=final_checklist,
+                )
+                db.add(new_task)
                 await db.commit()
-        else:
-            new_task = BureaucraticTask(
-                user_id=user_id,
-                task_name=task_name_detected,
-                target_country=target_country_detected,
-                status=(
-                    TaskStatus.READY_TO_SUBMIT
-                    if len([i for i in final_checklist if i.get("status") in ["MISSING", "EXPIRED"]]) == 0
-                    else TaskStatus.WAITING_DOCUMENTS
-                ),
-                checklist_state=final_checklist,
-            )
-            db.add(new_task)
-            await db.commit()
-            await db.refresh(new_task)
-            yield f"data: {json.dumps({'event': 'task_created', 'task_id': str(new_task.id)})}\n\n"
+                await db.refresh(new_task)
+                yield f"data: {json.dumps({'event': 'task_created', 'task_id': str(new_task.id)})}\n\n"
+    except Exception as db_exc:
+        pass
 
     yield "data: [DONE]\n\n"
 
@@ -157,7 +173,7 @@ async def run_agent_stream(
 @router.post("/chat")
 async def chat_with_agent(
     payload: ChatMessageRequest,
-    user_id: uuid.UUID = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id),
 ):
     """
     Submits a user query and returns a live Server-Sent Events (SSE) stream
@@ -180,36 +196,11 @@ async def chat_with_agent(
 
 @router.get("/tasks", response_model=List[TaskResponse])
 async def list_active_tasks(
-    user_id: uuid.UUID = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db_session),
 ):
     """Retrieves all tracked bureaucratic applications, checklists, and submission statuses."""
-    stmt = select(BureaucraticTask).where(BureaucraticTask.user_id == user_id).order_by(BureaucraticTask.created_at.desc())
+    stmt = select(BureaucraticTask).where(BureaucraticTask.user_id == str(user_id)).order_by(BureaucraticTask.created_at.desc())
     res = await db.execute(stmt)
     tasks = res.scalars().all()
     return tasks
-
-
-@router.post("/chat")
-async def chat_with_agent(
-    payload: ChatMessageRequest,
-    user_id: uuid.UUID = Depends(get_current_user_id),
-    db: AsyncSession = Depends(get_db_session),  # Add database session injection
-):
-    """
-    Submits a user query and returns a live Server-Sent Events (SSE) stream
-    reflecting each transition and the final response.
-    """
-    return StreamingResponse(
-        run_agent_stream(
-            user_id=user_id,
-            user_message=payload.message,
-            task_id=payload.task_id,
-        ),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "Content-Type": "text/event-stream",
-        },
-    )

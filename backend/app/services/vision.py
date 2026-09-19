@@ -5,10 +5,12 @@ import uuid
 from datetime import date
 from typing import Optional, Dict, Any, Tuple
 from pathlib import Path
+import base64
 
 from pydantic import BaseModel, Field
 from PIL import Image
 import pypdfium2 as pdfium
+from openai import OpenAI
 from google import genai
 from google.genai import types
 
@@ -50,9 +52,18 @@ def sanitize_sensitive_identifiers(doc_type: str, raw_id: Optional[str]) -> Opti
 
 class DocumentVisionService:
     def __init__(self):
-        self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
         self.vault_path = Path(settings.STORAGE_VAULT_PATH)
         self.vault_path.mkdir(parents=True, exist_ok=True)
+        self.openai_client = None
+        self.gemini_client = None
+
+        if settings.XAI_API_KEY:
+            self.openai_client = OpenAI(api_key=settings.XAI_API_KEY, base_url=settings.XAI_BASE_URL)
+        elif settings.GEMINI_API_KEY:
+            try:
+                self.gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+            except Exception:
+                self.gemini_client = None
 
     def _convert_bytes_to_images(self, file_bytes: bytes, mime_type: str) -> list[Image.Image]:
         images = []
@@ -79,17 +90,39 @@ class DocumentVisionService:
             "dates in YYYY-MM-DD format, and document numbers. Never expose sensitive private identifiers."
         )
 
-        response = self.client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[prompt] + pil_images,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                response_schema=DocumentMetadataExtraction,
-                temperature=0.1,
-            ),
-        )
+        if self.openai_client:
+            buffered = io.BytesIO()
+            pil_images[0].save(buffered, format="JPEG")
+            img_b64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
+            res = self.openai_client.chat.completions.create(
+                model="grok-2-vision-latest",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt + " Respond in JSON format."},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
+                        ]
+                    }
+                ],
+                response_format={"type": "json_object"}
+            )
+            raw_content = res.choices[0].message.content
+            extracted = DocumentMetadataExtraction.model_validate_json(raw_content)
+        elif self.gemini_client:
+            response = self.gemini_client.models.generate_content(
+                model="gemini-3.6-flash",
+                contents=[prompt] + pil_images,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=DocumentMetadataExtraction,
+                    temperature=0.1,
+                ),
+            )
+            extracted = DocumentMetadataExtraction.model_validate_json(response.text)
+        else:
+            raise ValueError("No AI vision API key configured (XAI_API_KEY or GEMINI_API_KEY required).")
 
-        extracted = DocumentMetadataExtraction.model_validate_json(response.text)
         if extracted.document_number:
             extracted.document_number = sanitize_sensitive_identifiers(extracted.doc_type, extracted.document_number)
 
