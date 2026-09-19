@@ -3,7 +3,7 @@ from typing import List, Optional
 from datetime import date
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
 from pydantic import BaseModel
-from sqlalchemy import select, and_, delete
+from sqlalchemy import select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import async_session_factory
@@ -14,12 +14,8 @@ from app.services.vision import vision_service, sanitize_sensitive_identifiers
 router = APIRouter(prefix="/documents", tags=["Documents"])
 
 
-# ==============================================================================
-# Request & Response Schemas
-# ==============================================================================
-
 class DocumentResponse(BaseModel):
-    id: uuid.UUID
+    id: str
     title: str
     doc_type: str
     category: DocumentCategory
@@ -35,16 +31,8 @@ class DocumentResponse(BaseModel):
         from_attributes = True
 
 
-# ==============================================================================
-# Dependency: Mock/Extracted Authenticated User
-# ==============================================================================
-
-async def get_current_user_id() -> uuid.UUID:
-    """
-    Dependency returning the verified user's UUID from JWT session context.
-    Using a deterministic fallback UUID for local testing.
-    """
-    return uuid.UUID("11111111-1111-1111-1111-111111111111")
+async def get_current_user_id() -> str:
+    return "11111111-1111-1111-1111-111111111111"
 
 
 async def get_db_session():
@@ -52,25 +40,17 @@ async def get_db_session():
         yield session
 
 
-# ==============================================================================
-# API Endpoints
-# ==============================================================================
-
 @router.post("/upload", response_model=DocumentResponse, status_code=status.HTTP_201_CREATED)
 async def upload_document(
     file: UploadFile = File(...),
-    user_id: uuid.UUID = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db_session),
 ):
-    """
-    Uploads a PDF or image, runs multimodal entity extraction,
-    encrypts the payload using AES-256-GCM, and persists metadata in PostgreSQL.
-    """
     allowed_mimes = ["application/pdf", "image/jpeg", "image/png", "image/webp"]
     if file.content_type not in allowed_mimes:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Unsupported file format '{file.content_type}'. Must be PDF, JPEG, PNG, or WEBP.",
+            detail=f"Unsupported format '{file.content_type}'. Must be PDF, JPEG, PNG, or WEBP.",
         )
 
     file_bytes = await file.read()
@@ -78,7 +58,6 @@ async def upload_document(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty.")
 
     try:
-        # Run OCR, Classification, and Encryption via Vision Service
         processed_data = await vision_service.process_incoming_file(
             user_id=user_id,
             file_bytes=file_bytes,
@@ -92,6 +71,7 @@ async def upload_document(
         )
 
     new_doc = Document(
+        id=str(uuid.uuid4()),
         user_id=user_id,
         title=processed_data["title"],
         doc_type=processed_data["doc_type"],
@@ -108,19 +88,16 @@ async def upload_document(
     )
 
     db.add(new_doc)
-    
-    # Write Audit Trail
     audit = AuditLog(
         user_id=user_id,
         action="DOCUMENT_UPLOADED",
         resource_type="DOCUMENT",
-        resource_id=str(new_doc.id),
+        resource_id=new_doc.id,
     )
     db.add(audit)
     await db.commit()
     await db.refresh(new_doc)
 
-    # Decrypt number for immediate response, ensuring protected IDs remain redacted
     decrypted_num = decrypt_field(new_doc.encrypted_doc_number) if new_doc.encrypted_doc_number else None
     safe_number = sanitize_sensitive_identifiers(new_doc.doc_type, decrypted_num)
 
@@ -141,10 +118,9 @@ async def upload_document(
 
 @router.get("", response_model=List[DocumentResponse])
 async def list_documents(
-    user_id: uuid.UUID = Depends(get_current_user_id),
+    user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db_session),
 ):
-    """Lists all active and expiring documents in the user's secure vault."""
     stmt = select(Document).where(Document.user_id == user_id).order_by(Document.created_at.desc())
     res = await db.execute(stmt)
     docs = res.scalars().all()
@@ -153,7 +129,7 @@ async def list_documents(
     for doc in docs:
         decrypted_num = decrypt_field(doc.encrypted_doc_number) if doc.encrypted_doc_number else None
         safe_number = sanitize_sensitive_identifiers(doc.doc_type, decrypted_num)
-        
+
         response_list.append(
             DocumentResponse(
                 id=doc.id,
@@ -169,17 +145,15 @@ async def list_documents(
                 file_size_bytes=doc.file_size_bytes,
             )
         )
-
     return response_list
 
 
 @router.delete("/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_document(
-    document_id: uuid.UUID,
-    user_id: uuid.UUID = Depends(get_current_user_id),
+    document_id: str,
+    user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db_session),
 ):
-    """Deletes document record and records compliance audit trail."""
     stmt = select(Document).where(and_(Document.id == document_id, Document.user_id == user_id))
     res = await db.execute(stmt)
     doc = res.scalar_one_or_none()
@@ -192,7 +166,7 @@ async def delete_document(
         user_id=user_id,
         action="DOCUMENT_DELETED",
         resource_type="DOCUMENT",
-        resource_id=str(document_id),
+        resource_id=document_id,
     )
     db.add(audit)
     await db.commit()

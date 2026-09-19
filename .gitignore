@@ -1,0 +1,10 @@
+# .gitignore
+.env
+*.env
+backend/.env
+backend/data/
+bureaucracy.db
+__pycache__/
+node_modules/
+dist/
+venv/
